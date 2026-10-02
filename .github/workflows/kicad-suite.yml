@@ -1,7 +1,7 @@
 name: KiCad suite (Linux)
 
 # Separate from ci.yml because installing KiCad costs minutes of wall clock, and
-# ci.yml's four-version matrix should stay fast. Same reasoning as
+# ci.yml's Python-version matrix should stay fast. Same reasoning as
 # macos-discovery.yml, whose structure this mirrors.
 #
 # It exists because ci.yml installs no KiCad, so 46 of 649 tests skip there. That
@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # KiCad 9, not the 10.0 series kicad.org ships as current stable: this repo
       # targets 9, and KICAD_SCH_VERSION is the KiCad 9 schematic format.
@@ -46,8 +46,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y kicad kicad-packages3d-
 
-      - uses: astral-sh/setup-uv@v7
-      - uses: actions/setup-python@v6
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           python-version: "3.10"
       - run: uv sync --frozen --all-extras --dev
@@ -85,6 +84,6 @@ jobs:
           PY
 
       # Only one Python version. kicad-cli is a subprocess and does not behave
-      # differently across 3.10-3.13, so spreading this over ci.yml's four matrix
-      # legs would quadruple a multi-minute install for nothing.
+      # differently across Python versions, so spreading this over ci.yml's
+      # matrix legs would repeat a multi-minute install per leg for nothing.
       - run: uv run pytest -v -n auto
