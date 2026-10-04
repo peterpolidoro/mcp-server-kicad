@@ -350,7 +350,7 @@ Ransomware protection, Allow an app through Controlled folder access.
 | `add_hierarchical_label` | Add a hierarchical label for sheet-to-sheet connections |
 | `remove_hierarchical_label` | Remove a hierarchical label by name or UUID |
 | `modify_hierarchical_label` | Modify text, shape, or position of a hierarchical label |
-| `add_power_symbol` | Place a power symbol (VCC, GND, +3V3, ...) with auto PWR_FLAG |
+| `add_power_symbol` | Place a power symbol (VCC, GND, +3V3, PWR_FLAG, ...) |
 | `add_text` | Add a text annotation to the schematic |
 | `remove_text` | Remove text annotation(s) by content, optionally filtered by position |
 | `wire_pins_to_net` | Wire one or more pins to a named net |
@@ -407,7 +407,7 @@ Ransomware protection, Allow an app through Controlled folder access.
 | `add_keepout_zone` | Create a keep-out zone restricting tracks, vias, pads, pours, or footprints |
 | `fill_zones` | Fill all copper zones on the board |
 | `set_net_class` | Create or update a net class with design rules |
-| `update_pcb_from_schematic` | Import or sync the schematic netlist onto the board (footprints and pad nets) |
+| `update_pcb_from_schematic` | Import or sync the schematic netlist onto the board: footprints, their fields, DNP and BOM flags, sheet linkage and pad nets; libraries through the project's `fp-lib-table` |
 
 **Analysis and export**
 

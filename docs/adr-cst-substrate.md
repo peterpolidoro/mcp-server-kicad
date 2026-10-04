@@ -235,3 +235,159 @@ Bytes the user did not ask us to change reach the disk unchanged, and any edit w
   nothing when it misses. Pointing the helper back at an in-place `_run_cli` turns four
   red; replacing the two `_atomic_write` calls with a direct `write_bytes` turns the
   two st_ino tests red.
+
+- 2026-10-02: `_atomic_write`'s temp gains a random part and an exclusive create. It
+  is now named `<name>.<pid>.<8 hex>.tmp` (`board.kicad_sch.1234.ab12cd34.tmp` where
+  the 2026-08-10 entry shows `board.kicad_sch.1234.tmp`); the suffix still follows the
+  whole name, for the reason that entry gives. The pid alone gave every writer of one
+  file in one process the same temp, and the temp was written with `write_bytes`,
+  which truncates whatever sits at the name. It is now created with `open(tmp, "xb")`
+  outside the cleanup's `try`, so a taken name raises and the file already there is
+  left as it was. The destination's mode moves with `os.fchmod` on the open descriptor
+  on Linux and macOS, where `shutil.copymode` went back through the path. Windows now
+  carries no mode at all: its only one is read-only, and copying that is what made the
+  read-only temp the 2026-08-15 entry describes, so the chmod-and-retry branch that
+  entry added to the cleanup is deleted along with its cause. A read-only destination
+  on Windows still fails the replace and is refused with the file intact, which
+  `test_a_read_only_original_is_platform_shaped` pins.
+
+- 2026-10-02: the footprint-library upgrade refuses a library it cannot copy safely.
+  Both copies of a `.pretty`, the `.bak` beside it and the scratch copy kicad-cli
+  upgrades, are `shutil.copytree`, which follows symlinks by default and recurses into
+  Windows junctions on purpose (its own source says so). A link to a device such as
+  `/dev/zero` would copy until the disk filled, and a link out of the library carries
+  whatever it points at into the `.bak`. `_require_plain_tree` now walks the library
+  first, follows nothing, and refuses by name any link, or anything that is neither a
+  regular file nor a directory, before either copy starts; the root itself must be a
+  real directory. Junctions count as links. Measured on Windows with Python 3.10.19, a
+  junction reads as a plain directory to `S_ISLNK` and to `is_symlink()`, and only its
+  reparse tag (`IO_REPARSE_TAG_MOUNT_POINT`) gives it away, which is the same test
+  `shutil._rmtree_islink` applies. Before this change a symlinked footprint, a junction
+  and a symlinked library root were all copied into a `.bak`, and a dangling link escaped the
+  scratch copy as a raw `shutil.Error`. Two smaller fixes ride along. A tree copy that
+  fails part way is now removed, where it used to stay beside the library as
+  `<name>.bak.<pid>.tmp` with nothing to collect it. And `upgrade_footprint_lib`
+  refuses a path that is not a directory before making a backup: given a `.kicad_mod`
+  it used to write the `.bak` and then hand the file to kicad-cli 9.0.8, which answered
+  "Output path must be specified to convert legacy and non-KiCad libraries". What the
+  walk cannot close is a link created between the walk and the copy; the case it
+  closes is a crafted library at rest.
+
+- 2026-10-02: `place_component` refuses a symbol it cannot define, closing a gap that
+  slice 10 carried over from the kiutils version unexamined. A placed symbol is a part
+  only because its definition sits in `lib_symbols` beside it; the instance just points
+  at it. The "not found" check ran only when a library file had been found, because it
+  existed to suggest similar names, so a prefixed lib_id whose stock library was
+  missing, a bare lib_id with no `symbol_lib_path`, and a bare lib_id whose library
+  lacked the symbol all wrote the instance anyway and reported success. Measured with
+  the stock lookup disabled: no definition, no pins, and `kicad-cli sch erc` at rc 0
+  with no violations, because a pinless symbol gives ERC nothing to check. That blind
+  spot is worth recording next to ADR-1's: loading proves only that KiCad could read
+  the file, never that the edit was the one asked for. The second case was worse.
+  12,127 of the stock symbols in a KiCad 9 install are derived, an `(extends "Parent")`
+  plus properties with the pins left in the parent, and the copy took that stub
+  verbatim; kicad-cli 9 then refused to load the whole schematic, and the same file
+  loaded once the `(extends ...)` node was removed. No test had ever placed a derived
+  symbol, so the oracle that would have caught it never saw one. KiCad embeds them
+  flattened: the three KiCad 9 demo schematics that use a derived stock symbol carry
+  the parent's pins and no `(extends ...)`, which is the harvest material ADR-2 asks
+  for once flattening is built. Until then the copy refuses a stub and names the
+  parent, which has the same pins. Refusing rather than building a definition follows
+  ADR-2 directly: the pins exist only in a library, and an invented definition is
+  exactly the hand-written construct it rules out. The check now runs on the result,
+  after every load attempt and in the old position (after the reference and bounds
+  refusals, before any write), and `add_power_symbol` and `auto_place_decoupling_cap`
+  inherit it because they call `place_component` first. `_system_sym_dirs` is the one
+  list both `_resolve_system_lib` and the refusal read, so the folders a refusal names
+  are the folders searched, and both library reads go through `_open_sym_lib`, which
+  turns a missing `symbol_lib_path` (a raw FileNotFoundError before) and a file that
+  is not a library (an IndexError before) into ToolErrors. Seven tests had been passing
+  on the KiCad-free CI legs only by writing orphans, measured by re-running the
+  affected tests with KiCad hidden: six fast ones and the bundle round trip. One of
+  them compared the pin UUIDs of a sheet and its duplicate, which for a pinless R7
+  meant comparing two empty lists. They now take the definition from a stand-in stock
+  folder, the `stock_symbol_dir` fixture behind `KICAD_SYMBOL_DIR`. The bundle test had
+  a problem of its own: uv rebuilds a local directory dependency only when its
+  `pyproject.toml` changes, so on a warm cache it ran a stale build of the package
+  rather than the checkout, and it passed against the code this change replaced until
+  `--reinstall-package` went into its command. Deliberately left out: flattening
+  derived symbols, the next slice; `add_power_symbol` silently skipping its PWR_FLAG
+  when the power library is missing, and writing the power symbol before the flag can
+  fail, which belong to the PWR_FLAG rework; the ValueError `connect_pins` raises for a
+  symbol with no definition, which the MCP SDK wraps exactly as it wraps a ToolError;
+  and resolving a prefix through a project sym-lib-table, which the refusal now states
+  plainly instead.
+
+- 2026-10-02: `wire_pins_to_net` no longer places a PWR_FLAG, so it emits no symbol and
+  copies no lib_symbols entry; its writes are wires, labels and junctions only, and the
+  slice-8 placed template and synthetic lib template are deleted with it. The flag was
+  decided per call, but whether a net needs one depends on every driver on the net, so
+  on a net that already had a flag or a power output it added a second one, which ERC
+  reports as "Pins of type Power output and Power output are connected" (measured on
+  kicad-cli 9.0.8 with two flags on one net). The routing pressure test also measured
+  kicad-cli ERC crashing (0xC0000005) when the auto flag's lib_id `power:PWR_FLAG`, with
+  no lib_name, met an entry `add_power_symbol` had copied under the bare name. The
+  verbatim system-library copy that this path used to exercise is still tested, now
+  through `place_component`. `add_power_symbol` loses its own automatic flag for the
+  same reason, plus a sharper one: a flag tells ERC the net has a source it cannot
+  see, which only the designer knows, so placing one beside every power symbol marked
+  every rail as driven and silenced the undriven-net check it exists to satisfy. It is
+  now one `place_component` call, which also ends its two-write sequence (symbol, then
+  flag) that could leave half the change on disk. Callers place a flag with
+  `add_power_symbol` and lib_id `power:PWR_FLAG`, on the nets that need one.
+
+- 2026-10-04: the netlist import carries what KiCad's own update carries, and
+  footprint libraries are resolved through the `fp-lib-table` files KiCad reads. Until
+  now `update_pcb_from_schematic` copied a footprint's Reference, Value, library id,
+  path and pad nets and nothing else, so a board it built differed from one KiCad's
+  F8 built in every field, every DNP and BOM flag and every sheet link, and a nickname
+  that only the project's table knew was reported `footprint_lib_not_found`. Both
+  halves were measured before they were written. The netlist side on kicad-cli 10.0.6:
+  a component's `<fields>` always lists Footprint, Datasheet and Description, empty or
+  not, plus the symbol's user fields; the three boxes arrive as value-less
+  `<property name="dnp"/>`, `exclude_from_bom` and `exclude_from_board` markers written
+  only when the box is ticked; the sheet is `<sheetpath names="/">` at the root plus a
+  `Sheetfile` property. The board side on a footprint KiCad's own update wrote (the
+  torque block's INA821, placed at 180 degrees): a user field lands as a hidden
+  `(property ...)` on the footprint's F.Fab at `(at 0 0 180)`, so its angle cancels the
+  footprint's and the text reads upright, `(unlocked yes)`, size 1 by 1, thickness
+  0.15; Datasheet and Description are updated in place where the library footprint
+  put them; `path`, `sheetname` and `sheetfile` follow the symbol; `(attr smd)` keeps
+  the mounting type; the library's own KiLib_Generator field survives; Footprint is
+  not a footprint field. `_FP_FIELD_TPL` is that measured node, `_ATTR_ORDER` is the
+  writer's token order in pcb_io_kicad_sexpr.cpp, and `_SYMBOL_OWNED_ATTRS` names the
+  two tokens the schematic owns, so clearing a box clears the flag while
+  `board_only`, `exclude_from_pos_files` and `allow_missing_courtyard` stay the
+  board's. One decision is recorded so it is not re-litigated: a field that left the
+  symbol is NOT removed from the footprint. KiCad itself keeps a footprint's library
+  fields through its update, and a property the user placed by hand is text an import
+  has no business deleting unasked; the cost is a stale field the user can delete,
+  against the alternative of destroying placed text. A symbol with "On board" unticked
+  is what KiCad's update treats as not on this board: never placed, listed in
+  `excluded_from_board`, its pins skipped in the pad pass without a warning, and a
+  footprint it left behind reported stale like any other. The oracle for DNP is KiCad,
+  not the bytes: `kicad-cli pcb export pos --exclude-dnp` drops exactly the flagged
+  footprint and keeps it again once the box is cleared. A first draft of that test
+  asserted `b"dnp" not in raw` and failed on a board with every flag cleared, because
+  the board's own setup carries `hidednponfab`, `sketchdnponfab` and `crossoutdnponfab`;
+  the assertion now names the attribute. On libraries: `_fp_lib_tables` is the one
+  reader of `fp-lib-table`, returning the project table and the global table apart
+  because they sit at different points of the search. KiCad's order is the project's
+  table, then the directories this package has always searched (`.pretty` beside the
+  board and schematic, `KICAD_FP_LIB`), then the global table, then the stock
+  footprints, and `place_footprint` now walks the same list so a hand-placed part and
+  an imported one resolve to one file. Only rows the package can serve are returned:
+  type KiCad, enabled, `${VAR}` expanded, directory present; `${KIPRJMOD}` is the
+  `.kicad_pro`'s directory (`_project_dir`, falling back to the first of the board's
+  and schematic's directories that holds a table or a project), every other variable
+  comes from the environment first and then from the resolved kicad-cli's install for
+  the `KICAD<N>_FOOTPRINT_DIR` family. Measured on KiCad 10.0.6: the global table under
+  `~/.config/kicad/10.0/` is a single `(type "Table")` row pointing at
+  `${KICAD10_TEMPLATE_DIR}/fp-lib-table`, whose 155 rows use `${KICAD10_FOOTPRINT_DIR}`,
+  so the reader follows one level of `Table` rows (`_LIB_TABLE_DEPTH`). An unreadable
+  or malformed table answers empty rather than failing the tool, since the table is a
+  hint about where libraries live and not the operation itself, and the refusal still
+  names every directory searched plus how many table rows named other libraries.
+  Gates: the two fields E2E tests (new, edited and cleared, idempotent on the second
+  run) and the table E2E test turn red without the three sync calls or the table
+  lookup; a second import that changes nothing is still byte-identical.

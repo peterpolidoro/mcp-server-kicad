@@ -25,6 +25,7 @@ from mcp_server_kicad._shared import (
     _gen_uuid,
     _kicad_root,
     _node_uuid,
+    _open_sym_lib,
     _read_kicad_bytes,
     _remove_root_symbol_instance,
     _require_kicad_path,
@@ -36,6 +37,7 @@ from mcp_server_kicad._shared import (
     _sheet_name_cst,
     _snap_grid,
     _sym_property_cst,
+    _system_sym_dirs,
     _upsert_root_symbol_instance,
     build_server,
 )
@@ -722,8 +724,9 @@ def place_component(
         x: X position in schematic units (mm)
         y: Y position in schematic units (mm)
         rotation: Rotation angle in degrees (0, 90, 180, 270)
-        symbol_lib_path: Path to .kicad_sym file if using custom library.
-            Optional; omit to use the configured default.
+        symbol_lib_path: Path to a .kicad_sym file that defines the symbol, for a
+            library outside KiCad's stock set. Optional; omit to load the symbol
+            from the stock library named by the lib_id prefix.
         mirror: Mirror axis ("x", "y", or "" for none)
         schematic_path: Path to .kicad_sch file. Optional; omit to use the configured default.
         project_path: Path to .kicad_pro file (for correct hierarchy resolution in sub-sheets)
@@ -750,9 +753,8 @@ def place_component(
     # downstream catches it: measured 2026-08-12, `kicad-cli sch erc` reports no
     # duplicate-reference violation even for a resistor and a capacitor both
     # called R1, so this tool is the only place it can be caught. Nothing in the
-    # package produces one legitimately either, since add_power_symbol already
-    # scans for a free #FLG number and this tool has no unit parameter, so it
-    # can never be placing a second unit of a multi-unit part.
+    # package produces one legitimately either: this tool has no unit parameter,
+    # so it can never be placing a second unit of a multi-unit part.
     if any(_sym_property_cst(sym, "Reference") == reference for sym in root.find_all("symbol")):
         raise ToolError(
             f"{reference} is already placed in this schematic. Reference designators"
@@ -766,37 +768,31 @@ def place_component(
     x = _snap_grid(x)
     y = _snap_grid(y)
 
-    # Load symbol definition from custom lib or system library
-    symbol_name = lib_id.split(":")[-1] if ":" in lib_id else lib_id
-    suggestions_lib = None
-    if _find_lib_symbol_cst(root, lib_id) is None:
+    # A placed symbol is a part only if its definition sits in lib_symbols
+    # beside it: KiCad keeps the body and pins there, and the instance merely
+    # points at them. Load it from symbol_lib_path when given, else from the
+    # stock library the lib_id prefix names, and refuse if neither has it.
+    # Measured 2026-10-02: this used to write the instance regardless, and a
+    # symbol with no definition has no pins, so kicad-cli loaded the file and ERC
+    # reported nothing at all. Placement time is the only time it can be caught.
+    symbol_name = lib_id.split(":")[-1]
+    lib_prefix = lib_id.split(":")[0] if ":" in lib_id else ""
+    lib_sym = _find_lib_symbol_cst(root, lib_id)
+    if lib_sym is None:
         if symbol_lib_path:
             _copy_lib_symbol_from_file_cst(root, symbol_lib_path, symbol_name, symbol_name)
-            suggestions_lib = symbol_lib_path
-        elif ":" in lib_id:
-            lib_prefix = lib_id.split(":")[0]
-            if not _copy_system_lib_symbol_cst(root, lib_prefix, symbol_name):
-                suggestions_lib = _resolve_system_lib(lib_prefix)
+        elif lib_prefix:
+            _copy_system_lib_symbol_cst(root, lib_prefix, symbol_name)
+        lib_sym = _find_lib_symbol_cst(root, lib_id)
+    if lib_sym is None:
+        raise ToolError(_no_definition_message(lib_id, symbol_name, lib_prefix, symbol_lib_path))
+    # The copy refuses a derived stub; this catches one an older version embedded.
+    _refuse_derived(lib_sym, lib_id)
 
-    # Check if lib_symbol was found; give helpful error if not
-    if _find_lib_symbol_cst(root, lib_id) is None and ":" in lib_id:
-        if suggestions_lib is not None:
-            lib_root = _cst.parse(Path(suggestions_lib).read_bytes()).lists[0]
-            available = [s.atoms[1].text for s in lib_root.find_all("symbol")]
-            similar = difflib.get_close_matches(symbol_name, available, n=5, cutoff=0.4)
-            lib_prefix = lib_id.split(":")[0]
-            if similar:
-                hint = f" Similar: {', '.join(similar)}"
-            else:
-                hint = " Try list_lib_symbols to search across all libraries."
-            raise ToolError(f"symbol '{symbol_name}' not found in {lib_prefix} library.{hint}")
-
-    # Create instance — lib_name mirrors the lib_symbol's stored name so KiCad
+    # Create the instance. lib_name mirrors the lib_symbol's stored name so KiCad
     # can resolve the lookup without crashing (see the slice-8 segfault note).
-    lib_sym = _find_lib_symbol_cst(root, lib_id)
     node = _SYMBOL_TPL.copy()
-    lib_name = lib_sym.atoms[1].text if lib_sym is not None else symbol_name
-    node.find("lib_name").atoms[1].set_text(lib_name)
+    node.find("lib_name").atoms[1].set_text(lib_sym.atoms[1].text)
     node.find("lib_id").atoms[1].set_text(lib_id)
     _check_rotation(rotation)
     _fill_at(node, x, y, rotation)
@@ -818,18 +814,17 @@ def place_component(
 
     # Pin UUIDs from the lib symbol
     instances = node.find("instances")
-    if lib_sym is not None:
-        pin_nums = set()
-        for unit_node in lib_sym.find_all("symbol"):
-            for pin in unit_node.find_all("pin"):
-                number = pin.find("number")
-                if number is not None:
-                    pin_nums.add(number.atoms[1].text)
-        for pn in sorted(pin_nums):
-            pnode = _PIN_REF_TPL.copy()
-            pnode.atoms[1].set_text(pn)
-            pnode.find("uuid").atoms[1].set_text(_gen_uuid())
-            node.insert_before(instances, pnode)
+    pin_nums = set()
+    for unit_node in lib_sym.find_all("symbol"):
+        for pin in unit_node.find_all("pin"):
+            number = pin.find("number")
+            if number is not None:
+                pin_nums.add(number.atoms[1].text)
+    for pn in sorted(pin_nums):
+        pnode = _PIN_REF_TPL.copy()
+        pnode.atoms[1].set_text(pn)
+        pnode.find("uuid").atoms[1].set_text(_gen_uuid())
+        node.insert_before(instances, pnode)
 
     # Instances block — required by KiCad 9 for proper annotation
     root_uuid = _node_uuid(root)
@@ -1107,34 +1102,6 @@ _PIN_REF_TPL = _cst.parse(b'(pin "1"\n\t(uuid "x")\n)').lists[0]
 _PROP_TPL = _cst.parse(
     b'(property "K" "V"\n\t(id 0)\n\t(at 0 0 0)\n\t(effects\n\t\t(font'
     b"\n\t\t\t(size 1.27 1.27)\n\t\t)\n\t\t(hide yes)\n\t)\n)"
-).lists[0]
-
-# Synthetic PWR_FLAG lib symbol for hosts without a KiCad install (CI): same
-# semantics as the system one (power flag, one power_out pin). When a system
-# library exists, the real node is copied verbatim instead.
-_PWR_FLAG_LIB_TPL = _cst.parse(
-    b'(symbol "power:PWR_FLAG"\n\t(power)\n\t(exclude_from_sim no)\n\t(in_bom no)\n\t(on_board yes)'
-    b'\n\t(symbol "PWR_FLAG_0_1")\n\t(symbol "PWR_FLAG_1_1"\n\t\t(pin power_out line'
-    b'\n\t\t\t(at 0 0 90)\n\t\t\t(length 0)\n\t\t\t(name "~"\n\t\t\t\t(effects\n\t\t\t\t\t(font'
-    b"\n\t\t\t\t\t\t(size 1.27 1.27)\n\t\t\t\t\t)\n\t\t\t\t)\n\t\t\t)"
-    b'\n\t\t\t(number "1"\n\t\t\t\t(effects\n\t\t\t\t\t(font\n\t\t\t\t\t\t(size 1.27 1.27)'
-    b"\n\t\t\t\t\t)\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n)"
-).lists[0]
-
-_PWR_FLAG_SYM_TPL = _cst.parse(
-    b'(symbol\n\t(lib_id "power:PWR_FLAG")\n\t(at 0 0 0)\n\t(unit 1)\n\t(exclude_from_sim no)'
-    b'\n\t(in_bom no)\n\t(on_board yes)\n\t(dnp no)\n\t(uuid "x")'
-    b'\n\t(property "Reference" "#FLG01"\n\t\t(at 0 0 0)\n\t\t(effects\n\t\t\t(font'
-    b"\n\t\t\t\t(size 1.27 1.27)\n\t\t\t)\n\t\t\t(hide yes)\n\t\t)\n\t)"
-    b'\n\t(property "Value" "PWR_FLAG"\n\t\t(at 0 0 0)\n\t\t(effects\n\t\t\t(font'
-    b"\n\t\t\t\t(size 1.27 1.27)\n\t\t\t)\n\t\t)\n\t)"
-    b'\n\t(property "Footprint" ""\n\t\t(at 0 0 0)\n\t\t(effects\n\t\t\t(font'
-    b"\n\t\t\t\t(size 1.27 1.27)\n\t\t\t)\n\t\t\t(hide yes)\n\t\t)\n\t)"
-    b'\n\t(property "Datasheet" "~"\n\t\t(at 0 0 0)\n\t\t(effects\n\t\t\t(font'
-    b"\n\t\t\t\t(size 1.27 1.27)\n\t\t\t)\n\t\t\t(hide yes)\n\t\t)\n\t)"
-    b'\n\t(pin "1"\n\t\t(uuid "x")\n\t)'
-    b'\n\t(instances\n\t\t(project "X"\n\t\t\t(path "/x"\n\t\t\t\t(reference "#FLG01")'
-    b"\n\t\t\t\t(unit 1)\n\t\t\t)\n\t\t)\n\t)\n)"
 ).lists[0]
 
 
@@ -1427,20 +1394,6 @@ def _get_pin_pos_cst(root, reference: str, pin_name: str) -> tuple[float, float,
     )
 
 
-def _pin_electrical_types_cst(lib_sym, pin_name: str) -> list[str]:
-    """Electrical types of every lib pin matching *pin_name* by name or number."""
-    out = []
-    for unit in lib_sym.find_all("symbol"):
-        for pin in unit.find_all("pin"):
-            name = pin.find("name")
-            number = pin.find("number")
-            if (name is not None and name.atoms[1].text == pin_name) or (
-                number is not None and number.atoms[1].text == pin_name
-            ):
-                out.append(pin.atoms[1].text)
-    return out
-
-
 def _splice_lib_symbol_cst(root, node) -> None:
     libs = root.find("lib_symbols")
     if libs is None:
@@ -1457,16 +1410,91 @@ def _copy_lib_symbol_from_file_cst(root, lib_path: str, symbol_name: str, new_na
     """Splice a copy of a .kicad_sym symbol node into lib_symbols.
 
     The node's bytes come straight from the library file (no emission
-    knowledge); only the name atom is rewritten to *new_name*.
+    knowledge); only the name atom is rewritten to *new_name*. A derived symbol
+    is refused rather than copied; see _refuse_derived.
     """
-    lib_root = _cst.parse(Path(lib_path).read_bytes()).lists[0]
+    _, lib_root = _open_sym_lib(lib_path)
     for s in lib_root.find_all("symbol"):
         if s.atoms[1].text == symbol_name:
+            _refuse_derived(s, new_name)
             node = s.copy()
             node.atoms[1].set_text(new_name)
             _splice_lib_symbol_cst(root, node)
             return True
     return False
+
+
+def _refuse_derived(definition, name: str) -> None:
+    """Refuse a derived symbol definition, which holds no pins of its own.
+
+    A derived symbol is an (extends "Parent") plus properties, with the body and
+    pins left in the parent; 12,127 of the stock symbols in a KiCad 9 install
+    are derived (counted 2026-10-02). KiCad embeds one flattened: the three
+    KiCad 9 demo schematics that use a derived stock symbol all carry the
+    parent's pins and no (extends ...). Copied verbatim, the stub names a parent
+    the schematic does not have, and kicad-cli 9 then refuses to load the whole
+    file: "Failed to load schematic" for Regulator_Linear:AMS1117-3.3, measured
+    2026-10-02, and the same file loaded once the (extends ...) node was removed.
+
+    Flattening is not implemented yet, so the honest outcome is a refusal that
+    names the parent: a derived symbol shares its parent's pins, so placing the
+    parent and setting its fields gets the same part.
+    """
+    extends = definition.find("extends")
+    if extends is None:
+        return
+    parent = extends.atoms[1].text
+    prefix = name.split(":")[0] + ":" if ":" in name else ""
+    raise ToolError(
+        f"'{name}' is a derived symbol: it extends '{parent}' and has no pins of its"
+        " own, and this server cannot flatten derived symbols yet. Embedded as it"
+        " stands, it makes KiCad refuse to load the schematic. Use"
+        f" '{prefix}{parent}' instead, which has the same pins, and set its Value,"
+        " Footprint and Datasheet with set_component_property. Nothing was written."
+    )
+
+
+def _no_definition_message(
+    lib_id: str, symbol_name: str, lib_prefix: str, symbol_lib_path: str
+) -> str:
+    """Why place_component has no definition for *lib_id*, and the ways out."""
+    lib_path = symbol_lib_path or (_resolve_system_lib(lib_prefix) if lib_prefix else None)
+    if lib_path:
+        # A library was read and lacks the symbol: name it, and what is close.
+        _, lib_root = _open_sym_lib(lib_path)
+        names = [s.atoms[1].text for s in lib_root.find_all("symbol")]
+        similar = difflib.get_close_matches(symbol_name, names, n=5, cutoff=0.4)
+        where = f"{lib_prefix} library ({lib_path})" if lib_prefix else lib_path
+        hint = (
+            f"Similar: {', '.join(similar)}."
+            if similar
+            else f"list_lib_symbols on {lib_path} shows what it holds."
+        )
+        return (
+            f"'{lib_id}': symbol '{symbol_name}' not found in {where}. {hint} Nothing was written."
+        )
+    if lib_prefix:
+        # No library file by that name in any folder the search covers.
+        searched = ", ".join(str(d) for d in _system_sym_dirs())
+        unknown = (
+            ""
+            if _kicad_root()
+            else " kicad-cli was not found, so KiCad's own library folder is unknown."
+        )
+        return (
+            f"'{lib_id}' not found: no {lib_prefix}.kicad_sym in {searched}.{unknown}"
+            " A lib_id prefix only resolves against KiCad's stock symbol libraries; a"
+            " project sym-lib-table is not read. Pass symbol_lib_path to the .kicad_sym"
+            f" that defines {symbol_name}, set KICAD_SYMBOL_DIR to the folder holding"
+            f" {lib_prefix}.kicad_sym, or load the definition first with add_lib_symbol."
+            " Nothing was written."
+        )
+    return (
+        f"'{lib_id}' not found: no symbol of that name is defined in this schematic,"
+        " and a lib_id without a library prefix has nowhere to load one from. Use the"
+        " Library:Symbol form (e.g. 'Device:R'), pass symbol_lib_path to a .kicad_sym"
+        " that defines it, or load it first with add_lib_symbol. Nothing was written."
+    )
 
 
 def _copy_system_lib_symbol_cst(root, lib_prefix: str, symbol_name: str) -> bool:
@@ -1892,8 +1920,9 @@ def add_power_symbol(
     Uses place_component internally. Power symbols are regular symbols
     from the 'power' library with isPower=True.
 
-    Automatically places a PWR_FLAG at the same position so the net
-    satisfies ERC (power pin driven).
+    Places only the symbol asked for. A PWR_FLAG tells ERC the net has a
+    source it cannot see, which only the designer knows, so add one with
+    lib_id="power:PWR_FLAG" on each net that needs it.
 
     Args:
         lib_id: Library ID (e.g. "power:VCC", "power:GND")
@@ -1901,12 +1930,13 @@ def add_power_symbol(
         x: X position
         y: Y position
         rotation: Rotation in degrees
-        symbol_lib_path: Path to power symbol .kicad_sym if not in schematic.
-            Optional; omit to use the configured default.
+        symbol_lib_path: Path to a .kicad_sym file that defines the power symbol,
+            for a library outside KiCad's stock set. Optional; omit to load it
+            from the stock library named by the lib_id prefix.
         schematic_path: Path to .kicad_sch file. Optional; omit to use the configured default.
         project_path: Path to .kicad_pro file (for sub-sheet instance tracking)
     """
-    result = place_component(
+    return place_component(
         lib_id=lib_id,
         reference=reference,
         value=lib_id.split(":")[-1],
@@ -1917,42 +1947,6 @@ def add_power_symbol(
         schematic_path=schematic_path,
         project_path=project_path,
     )
-
-    # Don't auto-add PWR_FLAG if we just placed one
-    symbol_name = lib_id.split(":")[-1] if ":" in lib_id else lib_id
-    if symbol_name == "PWR_FLAG":
-        return result
-
-    # Auto-place PWR_FLAG at the same position for ERC compliance
-    pwr_lib = symbol_lib_path or _resolve_system_lib("power")
-
-    if pwr_lib:
-        _, root, *_ = _open_sch_cst(schematic_path)
-        existing = {
-            r
-            for sym in root.find_all("symbol")
-            for r in [_sym_property_cst(sym, "Reference")]
-            if r is not None and r.startswith("#FLG")
-        }
-        n = 1
-        while f"#FLG{n:02d}" in existing:
-            n += 1
-        flg_ref = f"#FLG{n:02d}"
-
-        place_component(
-            lib_id="power:PWR_FLAG",
-            reference=flg_ref,
-            value="PWR_FLAG",
-            x=x,
-            y=y,
-            rotation=0,
-            symbol_lib_path=pwr_lib,
-            schematic_path=schematic_path,
-            project_path=project_path,
-        )
-        result += f" + {flg_ref}"
-
-    return result
 
 
 @mcp.tool(annotations=_ADDITIVE)
@@ -1983,8 +1977,9 @@ def auto_place_decoupling_cap(
         power_net: Label for pin 1 (e.g. "VCC", "+3V3")
         ground_net: Label for pin 2 (e.g. "GND", "PGND")
         rotation: Rotation in degrees (default 0)
-        symbol_lib_path: Path to .kicad_sym if using custom lib.
-            Optional; omit to use the configured default.
+        symbol_lib_path: Path to a .kicad_sym file that defines the capacitor,
+            for a library outside KiCad's stock set. Optional; omit to load it
+            from the stock library named by the lib_id prefix.
         schematic_path: Path to .kicad_sch file. Optional; omit to use the configured default.
         project_path: Path to .kicad_pro file (for sub-sheet instance tracking)
     """
@@ -2108,19 +2103,19 @@ def wire_pins_to_net(
     label_text: str,
     direction: str = "auto",
     stub_length: float = 2.54,
-    auto_pwr_flag: bool = True,
     schematic_path: str = SCH_PATH,
 ) -> str:
     """Wire multiple component pins to the same net label.
 
     Wires each pin with a short stub and a shared net label, one file write.
+    It places no PWR_FLAG: whether a net needs one depends on every driver on
+    the net, not on the pins in one call. Use add_power_symbol for that.
 
     Args:
         pins: List of {"reference": "R1", "pin": "1"} dicts
         label_text: Net label text (e.g. "GND", "VCC")
         direction: Wire direction: "auto", "left", "right", "up", "down"
         stub_length: Wire stub length in mm (default 2.54)
-        auto_pwr_flag: Auto-place PWR_FLAG when net has power_in but no power_out (default True)
         schematic_path: Path to .kicad_sch file. Optional; omit to use the configured default.
     """
     if not pins:
@@ -2129,8 +2124,6 @@ def wire_pins_to_net(
     tol = 0.1
     warnings = []
     stub_endpoints = []
-    first_power_in_pos = None  # (x, y) of first power_in stub endpoint
-    has_power_out = False  # True if any wired pin is power_out
     for pin_def in pins:
         ref = pin_def["reference"]
         pin_name = pin_def["pin"]
@@ -2206,89 +2199,7 @@ def wire_pins_to_net(
         label_node.find("uuid").atoms[1].set_text(_gen_uuid())
         _splice_sch_node(root, "label", label_node)
 
-        # Track pin electrical types for auto PWR_FLAG logic
-        if first_power_in_pos is None or not has_power_out:
-            target = _find_sym_cst(root, ref)
-            if target is not None:
-                lib_sym = _find_lib_symbol_cst(root, target.find("lib_id").atoms[1].text)
-                if lib_sym is not None:
-                    for etype in _pin_electrical_types_cst(lib_sym, pin_name):
-                        if etype == "power_in" and first_power_in_pos is None:
-                            first_power_in_pos = (end_x, end_y)
-                        if etype == "power_out":
-                            has_power_out = True
-
     _auto_junctions_cst(root, stub_endpoints)
-
-    # Auto-add PWR_FLAG if net has power_in but no power_out
-    if auto_pwr_flag and first_power_in_pos is not None and not has_power_out:
-        # Check if PWR_FLAG already exists on this net
-        labels_xy = [
-            _node_xy(lbl) for lbl in root.find_all("label") if _node_text(lbl) == label_text
-        ]
-        has_existing_flag = any(
-            abs(lx - sx) < tol and abs(ly - sy) < tol
-            for sym in root.find_all("symbol")
-            if _sym_property_cst(sym, "Value") == "PWR_FLAG"
-            for sx, sy in [_node_xy(sym)]
-            for lx, ly in labels_xy
-        )
-
-        if not has_existing_flag:
-            # Ensure PWR_FLAG lib symbol exists: verbatim copy from the system
-            # library, falling back to the synthetic template on bare CI hosts.
-            if _find_lib_symbol_cst(root, "power:PWR_FLAG") is None:
-                if not _copy_system_lib_symbol_cst(root, "power", "PWR_FLAG"):
-                    _splice_lib_symbol_cst(root, _PWR_FLAG_LIB_TPL.copy())
-
-            # Generate unique #FLG reference
-            existing_flg = {
-                r
-                for sym in root.find_all("symbol")
-                for r in [_sym_property_cst(sym, "Reference")]
-                if r is not None and r.startswith("#FLG")
-            }
-            n = 1
-            while f"#FLG{n:02d}" in existing_flg:
-                n += 1
-            flg_ref = f"#FLG{n:02d}"
-
-            fx, fy = first_power_in_pos
-            node = _PWR_FLAG_SYM_TPL.copy()
-            _fill_at(node, fx, fy)
-            node.find("uuid").atoms[1].set_text(_gen_uuid())
-            props = node.find_all("property")
-            offsets = [round(fy - 3.81, 4), round(fy + 3.81, 4), fy, fy]
-            for prop, py_off in zip(props, offsets):
-                _fill_at(prop, fx, py_off)
-            props[0].atoms[2].set_text(flg_ref)
-            node.find("pin").find("uuid").atoms[1].set_text(_gen_uuid())
-
-            # Instances block — required by KiCad 9 for proper annotation
-            root_uuid = _node_uuid(root)
-            project_name = Path(schematic_path).stem
-            sheet_path = f"/{root_uuid}"
-            # Check if this is a sub-sheet by looking for a .kicad_pro
-            sch_dir = Path(schematic_path).parent
-            pro_files = list(sch_dir.glob("*.kicad_pro"))
-            if len(pro_files) == 1:
-                pro = pro_files[0]
-                project_name = pro.stem
-                root_sch_path = pro.with_suffix(".kicad_sch")
-                if root_sch_path.resolve() != Path(schematic_path).resolve():
-                    try:
-                        project_name, sheet_path = _resolve_hierarchy_path(
-                            str(pro), schematic_path, root_uuid
-                        )
-                    except Exception:
-                        pass  # Fall back to simple path
-            project = node.find("instances").find("project")
-            project.atoms[1].set_text(project_name)
-            inst_path = project.find("path")
-            inst_path.atoms[1].set_text(sheet_path)
-            inst_path.find("reference").atoms[1].set_text(flg_ref)
-
-            _splice_sch_node(root, "symbol", node)
 
     _atomic_write(schematic_path, _cst.serialize(tree))
     msg = f"Wired {len(pins)} pins to '{label_text}'."
